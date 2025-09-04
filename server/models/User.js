@@ -69,22 +69,25 @@ class UserModel {
     if (this.users.size === 0) {
       console.log('Production mode: No users found, creating initial admin user');
       try {
+        const strongPassword = process.env.ADMIN_PASSWORD && process.env.ADMIN_PASSWORD.length >= 12
+          ? process.env.ADMIN_PASSWORD
+          : `Admin-${Math.random().toString(36).slice(2)}-${Date.now()}`;
         const adminUser = await this.createUser({
-          email: 'admin@laborresults.de',
-          password: 'admin123',
+          email: process.env.ADMIN_EMAIL || 'admin@laborresults.de',
+          password: strongPassword,
           firstName: 'System',
           lastName: 'Administrator',
           role: USER_ROLES.ADMIN,
-          bsnr: '999999999',
-          lanr: '9999999',
+          bsnr: process.env.ADMIN_BSNR || '999999999',
+          lanr: process.env.ADMIN_LANR || '9999999',
           isActive: true
         });
 
         // Log admin user creation (only in development/production setup)
-        if (process.env.NODE_ENV !== 'production' || process.env.LOG_ADMIN_CREATION === 'true') {
+        if (process.env.LOG_ADMIN_CREATION === 'true') {
           console.log('✅ Initial admin user created for production');
           console.log(`   Email: ${adminUser.email}`);
-          console.log(`   Password: admin123 (CHANGE IMMEDIATELY!)`);
+          console.log(`   Password set via ADMIN_PASSWORD or generated. CHANGE IMMEDIATELY!`);
           console.log('   ⚠️  IMPORTANT: Change the default password immediately!');
         }
       } catch (error) {
@@ -101,8 +104,8 @@ class UserModel {
       return;
     }
     
-    // Only create default users in development/testing
-    if (process.env.NODE_ENV === 'development' || process.env.NODE_ENV === 'test') {
+    // Create default users in all non-production environments
+    if (process.env.NODE_ENV !== 'production') {
       try {
         // Create default admin user
         const adminUser = await this.createUser({

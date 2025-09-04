@@ -1,5 +1,9 @@
 // server/server.js
 require('dotenv').config(); // Load environment variables from .env
+// Development convenience: fallback JWT secret if missing (never used in production)
+if (process.env.NODE_ENV !== 'production' && !process.env.JWT_SECRET) {
+  process.env.JWT_SECRET = 'dev-jwt-secret-key-for-development-only-change-in-production';
+}
 const express = require('express');
 const cors = require('cors');
 const helmet = require('helmet');
