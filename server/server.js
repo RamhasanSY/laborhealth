@@ -1,4 +1,3 @@
-// server/server.js
 require('dotenv').config(); // Load environment variables from .env
 // Development convenience: fallback JWT secret if missing (never used in production)
 if (process.env.NODE_ENV !== 'production' && !process.env.JWT_SECRET) {
@@ -9,11 +8,21 @@ const cors = require('cors');
 const helmet = require('helmet');
 const compression = require('compression');
 const rateLimit = require('express-rate-limit');
+const csrf = require('csurf');
+let cookieParser = null;
+try {
+  cookieParser = require('cookie-parser');
+} catch (e) {
+  // Optional in development; CSRF will be relaxed without it
+  // eslint-disable-next-line no-console
+  console.warn('cookie-parser not installed; CSRF cookie support disabled in this environment');
+}
 const NodeCache = require('node-cache');
 const winston = require('winston');
 const path = require('path');
 const LDTGenerator = require('./utils/ldtGenerator');
 const PDFGenerator = require('./utils/pdfGenerator');
+const { sendLDTToMirth } = require('./utils/mirthClient');
 const { UserModel, USER_ROLES, ROLE_PERMISSIONS } = require('./models/User');
 const bodyParser = require('body-parser');
 const parseLDT = require('./utils/ldtParser');
@@ -80,16 +89,39 @@ register.registerMetric(httpRequestCounter);
 const tokenStore = new Map(); // token -> { userId, expiresAt, revoked }
 const revokedTokens = new Set();
 
-// Clean up expired tokens every hour
-setInterval(() => {
+// Enhanced token cleanup with better memory management
+const cleanupExpiredTokens = () => {
   const now = Date.now();
+  let cleanedCount = 0;
+  
   for (const [token, data] of tokenStore.entries()) {
     if (data.expiresAt < now || data.revoked) {
       tokenStore.delete(token);
       revokedTokens.delete(token);
+      cleanedCount++;
     }
   }
-}, 60 * 60 * 1000); // Every hour
+  
+  // Also clean up revoked tokens set periodically
+  if (revokedTokens.size > 1000) {
+    const oldSize = revokedTokens.size;
+    // Keep only recent revoked tokens (last 1000)
+    const tokensArray = Array.from(revokedTokens);
+    revokedTokens.clear();
+    tokensArray.slice(-1000).forEach(token => revokedTokens.add(token));
+    logger.info(`Cleaned up revoked tokens: ${oldSize} -> ${revokedTokens.size}`);
+  }
+  
+  if (cleanedCount > 0) {
+    logger.info(`Cleaned up ${cleanedCount} expired tokens. Active tokens: ${tokenStore.size}`);
+  }
+};
+
+// Clean up expired tokens every 15 minutes
+setInterval(cleanupExpiredTokens, 15 * 60 * 1000);
+
+// Initial cleanup on startup
+cleanupExpiredTokens();
 
 // Ensure logs directories exist for Winston logging
 const LOGS_DIR = path.join(__dirname, 'logs');
@@ -155,9 +187,9 @@ const logger = winston.createLogger({
       maxsize: 5242880, // 5MB
       maxFiles: 5,
     }),
-    new winston.transports.Console({
+    ...(process.env.NODE_ENV !== 'production' ? [new winston.transports.Console({
       format: winston.format.simple()
-    })
+    })] : [])
   ],
 });
 
@@ -224,17 +256,17 @@ app.use((req, res, next) => {
 // Optimized compression with better settings
 app.use(compression({
   filter: (req, res) => {
-    // Don't compress small responses or already compressed content
-    if (req.headers['x-no-compression'] || 
-        req.headers['content-encoding'] ||
-        req.headers['content-length'] < 1024) {
-      return false;
-    }
+    if (req.headers['x-no-compression']) return false;
+    // Skip Server-Sent Events and if downstream proxies mark no-transform
+    const accept = req.headers['accept'] || '';
+    if (accept.includes('text/event-stream')) return false;
+    const cacheControl = res.getHeader && res.getHeader('Cache-Control');
+    if (typeof cacheControl === 'string' && cacheControl.includes('no-transform')) return false;
     return compression.filter(req, res);
   },
-  threshold: 1024, // Only compress responses larger than 1KB
-  level: 6, // Balanced compression level
-  memLevel: 8, // Memory usage for compression
+  threshold: 1024,
+  level: 6,
+  memLevel: 8,
 }));
 
 // Metrics endpoint
@@ -269,8 +301,10 @@ const limiter = rateLimit({
   skipFailedRequests: false,
   // Enhanced security for production
   keyGenerator: (req) => {
-    // Use IP + user agent for better rate limiting
-    return req.ip + ':' + (req.headers['user-agent'] || 'unknown');
+    const tenant = req.tenantId || 'default';
+    const userId = req.user?.id || 'anonymous';
+    const ua = req.headers['user-agent'] || 'unknown';
+    return `${tenant}:${userId}:${req.ip}:${ua}`;
   },
   handler: (req, res) => {
     logger.warn(`Rate limit exceeded for IP: ${req.ip}`);
@@ -289,7 +323,11 @@ const authLimiter = rateLimit({
   message: 'Too many login attempts, please try again later.',
   skipSuccessfulRequests: true,
   skipFailedRequests: false,
-  keyGenerator: (req) => req.ip,
+  keyGenerator: (req) => {
+    const tenant = req.tenantId || 'default';
+    const identifier = (req.body?.email) || `${req.body?.bsnr || ''}-${req.body?.lanr || ''}` || 'anonymous';
+    return `${tenant}:${req.ip}:${identifier}`;
+  },
   handler: (req, res) => {
     logger.warn(`Auth rate limit exceeded for IP: ${req.ip}`);
     res.status(429).json({
@@ -307,7 +345,11 @@ const downloadLimiter = rateLimit({
   message: 'Too many download requests, please try again later.',
   skipSuccessfulRequests: true,
   skipFailedRequests: false,
-  keyGenerator: (req) => req.ip,
+  keyGenerator: (req) => {
+    const tenant = req.tenantId || 'default';
+    const userId = req.user?.id || 'anonymous';
+    return `${tenant}:${userId}:${req.ip}`;
+  },
   handler: (req, res) => {
     logger.warn(`Download rate limit exceeded for IP: ${req.ip}`);
     res.status(429).json({
@@ -325,7 +367,11 @@ const adminLimiter = rateLimit({
   message: 'Too many admin requests, please try again later.',
   skipSuccessfulRequests: false,
   skipFailedRequests: false,
-  keyGenerator: (req) => req.ip,
+  keyGenerator: (req) => {
+    const tenant = req.tenantId || 'default';
+    const userId = req.user?.id || 'anonymous';
+    return `${tenant}:${userId}:${req.ip}`;
+  },
   handler: (req, res) => {
     logger.warn(`Admin rate limit exceeded for IP: ${req.ip}`);
     res.status(429).json({
@@ -378,11 +424,57 @@ const corsOptions = {
   credentials: true,
   optionsSuccessStatus: 200,
   methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-Tenant-Id'],
   maxAge: 86400, // Cache preflight requests for 24 hours
 };
 app.use(cors(corsOptions));
 app.options(/.*/, cors(corsOptions));
+
+// Parse cookies before CSRF so cookie-based CSRF tokens work
+if (cookieParser) {
+  app.use(cookieParser());
+}
+
+// CSRF protection for state-changing operations (disabled by default in development)
+const CSRF_ENABLED = process.env.ENABLE_CSRF === 'true';
+const csrfProtection = (CSRF_ENABLED && cookieParser) ? csrf({
+  cookie: {
+    httpOnly: true,
+    secure: process.env.NODE_ENV === 'production',
+    sameSite: 'strict'
+  }
+}) : (req, res, next) => next();
+
+// Apply CSRF protection to all POST, PUT, DELETE requests (after webhook)
+app.use((req, res, next) => {
+  // Skip CSRF checks for read-only requests
+  if (!['POST', 'PUT', 'DELETE', 'PATCH'].includes(req.method)) {
+    return next();
+  }
+  // Skip auth endpoints and signed Mirth webhook ingestion before body parsers
+  const p = req.path || '';
+  const hasWebhookSignature = !!(req.headers['x-signature'] || req.headers['x-signature-sha256']);
+  if (
+    p === '/api/login' ||
+    p === '/api/auth/login' ||
+    p.startsWith('/api/mirth-webhook') ||
+    p.startsWith('/api/mirth/webhook') ||
+    hasWebhookSignature
+  ) {
+    return next();
+  }
+  return csrfProtection(req, res, next);
+});
+
+// CSRF token endpoint for clients to retrieve token
+app.get('/api/csrf-token', csrfProtection, (req, res) => {
+  try {
+    const token = typeof req.csrfToken === 'function' ? req.csrfToken() : 'disabled-in-dev';
+    res.json({ success: true, csrfToken: token });
+  } catch (e) {
+    res.status(500).json({ success: false, message: 'Failed to generate CSRF token' });
+  }
+});
 
 // Enhanced body parsing with security limits
 const maxBodySize = process.env.NODE_ENV === 'production' ? '5mb' : '10mb';
@@ -421,6 +513,20 @@ app.use((err, req, res, next) => {
   next(err);
 });
 
+// Handle CSRF errors gracefully
+app.use((err, req, res, next) => {
+  if (err && (err.code === 'EBADCSRFTOKEN' || (err.message && err.message.toLowerCase().includes('csrf')))) {
+    const p = req.path || '';
+    const hasWebhookSignature = !!(req.headers?.['x-signature'] || req.headers?.['x-signature-sha256']);
+    if (p.startsWith('/api/mirth-webhook') || p.startsWith('/api/mirth/webhook') || hasWebhookSignature) {
+      // Bypass CSRF error for signed webhook requests
+      return next();
+    }
+    return res.status(403).json({ success: false, message: 'Invalid CSRF token' });
+  }
+  next(err);
+});
+
 // Request size validation middleware
 app.use((req, res, next) => {
   const contentLength = parseInt(req.headers['content-length'] || '0');
@@ -444,8 +550,24 @@ app.use((req, res, next) => {
   res.send = function(data) {
     try {
       const duration = Date.now() - start;
-      const bodyBuffer = Buffer.isBuffer(data) ? data : Buffer.from(typeof data === 'string' ? data : JSON.stringify(data || ''));
-      const size = bodyBuffer.length;
+      let size = 0;
+      if (Buffer.isBuffer(data)) {
+        size = data.length;
+      } else if (typeof data === 'string') {
+        size = Buffer.byteLength(data, 'utf8');
+      } else {
+        // Avoid heavy stringify for large objects; approximate size using header if available
+        const contentLengthHeader = res.getHeader('Content-Length');
+        if (contentLengthHeader) {
+          size = Number(contentLengthHeader) || 0;
+        } else {
+          try {
+            size = Buffer.byteLength(JSON.stringify(data || ''), 'utf8');
+          } catch (_) {
+            size = 0;
+          }
+        }
+      }
       
       logger.info(`${req.method} ${req.originalUrl} - ${res.statusCode} - ${duration}ms - ${size}bytes - User: ${req.user?.email || 'anonymous'}`);
       
@@ -478,7 +600,7 @@ const cacheMiddleware = (duration = 300) => (req, res, next) => {
   }
   
   try {
-    const key = `${req.originalUrl}-${req.user?.userId || 'anonymous'}`;
+    const key = `${req.originalUrl}-${req.user?.id || 'anonymous'}`;
     const cached = cache.get(key);
     
     if (cached) {
@@ -764,12 +886,25 @@ const mockDatabase = {
   // Raw inbound LDT messages received from external systems
   ldtMessages: [],
 
+  // Outbound delivery tracking
+  deliveries: [],
+
   /**
    * Persist a newly received LDT message in memory.
    * @param {object} messageObj { id, receivedAt, raw, parsed }
    */
   addLDTMessage(messageObj) {
     this.ldtMessages.push(messageObj);
+  },
+
+  addDelivery(delivery) {
+    this.deliveries.push({
+      id: crypto.randomUUID(),
+      createdAt: new Date().toISOString(),
+      status: 'queued',
+      attempts: 0,
+      ...delivery,
+    });
   },
 
   /**
@@ -931,8 +1066,10 @@ const mockDatabase = {
         
       case USER_ROLES.PATIENT:
         // Patients can only see their own results (would need patient ID matching)
-        return filteredResults.filter(result => 
-          result.patientEmail === user.email // This would be implemented with proper patient records
+        return filteredResults.filter(result =>
+          result.assignedTo === user.email ||
+          (Array.isArray(result.assignedUsers) && result.assignedUsers.includes(user.email)) ||
+          result.patientEmail === user.email
         );
         
       default:
@@ -1127,16 +1264,38 @@ app.post('/api/auth/login', asyncHandler(async (req, res) => {
   try {
     const authResult = await userModel.authenticateUser(email, password, bsnr, lanr, otp);
     
-    logger.info(`Successful login for user: ${authResult.user.email} (${authResult.user.role})`);
+    // Generate new session ID to prevent session fixation
+    const sessionId = crypto.randomUUID();
+    
+    // Store session information
+    tokenStore.set(authResult.token, {
+      userId: authResult.user.id,
+      expiresAt: Date.now() + (15 * 60 * 1000), // 15 minutes
+      revoked: false,
+      sessionId: sessionId,
+      ip: req.ip,
+      userAgent: req.headers['user-agent']
+    });
+    
+    logger.info(`Successful login for user: ${authResult.user.email} (${authResult.user.role})`, {
+      userId: authResult.user.id,
+      ip: req.ip,
+      userAgent: req.headers['user-agent'],
+      sessionId: sessionId
+    });
     
     res.json({
       success: true,
       message: 'Login successful',
       token: authResult.token,
-      user: authResult.user
+      user: authResult.user,
+      sessionId: sessionId
     });
   } catch (error) {
-    logger.warn(`Failed login attempt: ${email || `${bsnr}/${lanr}`} - ${error.message}`);
+    logger.warn(`Failed login attempt: ${email || `${bsnr}/${lanr}`} - ${error.message}`, {
+      ip: req.ip,
+      userAgent: req.headers['user-agent']
+    });
     
     res.status(401).json({
       success: false,
@@ -1312,7 +1471,18 @@ app.post('/api/users', authenticateToken, requireAdmin, asyncHandler(async (req,
 
     const newUser = await userModel.createUser(req.body);
     
-    logger.info(`New user created: ${newUser.email} (${newUser.role}) by ${req.user.email}`);
+    // Enhanced audit logging for user creation
+    logger.info(`New user created: ${newUser.email} (${newUser.role}) by ${req.user.email}`, {
+      event: 'USER_CREATE',
+      newUserId: newUser.id,
+      newUserEmail: newUser.email,
+      newUserRole: newUser.role,
+      createdBy: req.user.email,
+      createdByRole: req.user.role,
+      ip: req.ip,
+      userAgent: req.headers['user-agent'],
+      timestamp: new Date().toISOString()
+    });
     
     res.status(201).json({
       success: true,
@@ -1480,6 +1650,15 @@ app.put('/api/users/:userId', authenticateToken, asyncHandler(async (req, res) =
   const { userId } = req.params;
   const updates = req.body;
   
+  // Check if user exists
+  const targetUser = userModel.getUserById(userId);
+  if (!targetUser) {
+    return res.status(404).json({
+      success: false,
+      message: 'User not found'
+    });
+  }
+  
   // Users can update their own profile with limited fields
   if (req.user.id !== userId && req.user.role !== USER_ROLES.ADMIN) {
     return res.status(403).json({
@@ -1501,10 +1680,36 @@ app.put('/api/users/:userId', authenticateToken, asyncHandler(async (req, res) =
     }
   }
   
+  // Prevent privilege escalation - only admins can change roles or admin status
+  if (updates.role && req.user.role !== USER_ROLES.ADMIN) {
+    return res.status(403).json({
+      success: false,
+      message: 'Only administrators can change user roles'
+    });
+  }
+  
+  if (updates.isActive !== undefined && req.user.role !== USER_ROLES.ADMIN) {
+    return res.status(403).json({
+      success: false,
+      message: 'Only administrators can activate/deactivate users'
+    });
+  }
+  
   try {
     const updatedUser = await userModel.updateUser(userId, updates);
     
-    logger.info(`User updated: ${updatedUser.email} by ${req.user.email}`);
+    // Enhanced audit logging for user updates
+    logger.info(`User updated: ${updatedUser.email} by ${req.user.email}`, {
+      event: 'USER_UPDATE',
+      targetUserId: userId,
+      targetUserEmail: updatedUser.email,
+      updatedBy: req.user.email,
+      updatedByRole: req.user.role,
+      updatedFields: Object.keys(updates),
+      ip: req.ip,
+      userAgent: req.headers['user-agent'],
+      timestamp: new Date().toISOString()
+    });
     
     res.json({
       success: true,
@@ -1542,7 +1747,18 @@ app.delete('/api/users/:userId', authenticateToken, requireAdmin, asyncHandler(a
     
     userModel.deleteUser(userId);
     
-    logger.info(`User deleted: ${user.email} by ${req.user.email}`);
+    // Enhanced audit logging for user deletion
+    logger.info(`User deleted: ${user.email} by ${req.user.email}`, {
+      event: 'USER_DELETE',
+      deletedUserId: userId,
+      deletedUserEmail: user.email,
+      deletedUserRole: user.role,
+      deletedBy: req.user.email,
+      deletedByRole: req.user.role,
+      ip: req.ip,
+      userAgent: req.headers['user-agent'],
+      timestamp: new Date().toISOString()
+    });
     
     res.json({
       success: true,
@@ -1635,6 +1851,64 @@ app.get('/api/results/:resultId', authenticateToken, asyncHandler(async (req, re
 }));
 
 // === ADMIN ENDPOINTS ===
+
+// Publish a specific result to Mirth (Admin or Lab Technician)
+app.post('/api/results/:resultId/publish', authenticateToken, asyncHandler(async (req, res) => {
+  const { resultId } = req.params;
+
+  if (!(req.user.role === USER_ROLES.ADMIN || req.user.role === USER_ROLES.LAB_TECHNICIAN)) {
+    return res.status(403).json({ success: false, message: 'Insufficient permissions' });
+  }
+
+  const result = mockDatabase.results.find(r => r.id === resultId);
+  if (!result) {
+    return res.status(404).json({ success: false, message: 'Result not found' });
+  }
+
+  try {
+    const ldtGenerator = new LDTGenerator();
+    const ldtContent = ldtGenerator.generateLDT([result], {
+      labInfo: {
+        name: process.env.LAB_NAME || 'Labor Results System',
+        street: process.env.LAB_STREET || 'Medical Center Street 1',
+        zipCode: process.env.LAB_ZIP || '12345',
+        city: process.env.LAB_CITY || 'Medical City',
+        phone: process.env.LAB_PHONE || '+49-123-456789',
+        email: process.env.LAB_EMAIL || 'info@laborresults.de'
+      },
+      provider: { bsnr: result.bsnr, lanr: result.lanr }
+    });
+
+    mockDatabase.addDelivery({
+      resultId,
+      userEmail: req.user.email,
+      bodyHash: crypto.createHash('sha256').update(ldtContent).digest('hex'),
+      endpoint: process.env.MIRTH_OUTBOUND_URL || null,
+    });
+
+    const resp = await sendLDTToMirth(ldtContent);
+
+    // Update tracking (simple append)
+    mockDatabase.addDelivery({
+      resultId,
+      userEmail: req.user.email,
+      status: 'delivered',
+      responseStatus: resp.status,
+    });
+
+    logger.info('Published result to Mirth', { resultId, status: resp.status });
+    return res.json({ success: true, message: 'Delivered to Mirth', status: resp.status });
+  } catch (error) {
+    mockDatabase.addDelivery({
+      resultId,
+      userEmail: req.user.email,
+      status: 'failed',
+      error: error.message,
+    });
+    logger.error('Failed to publish result to Mirth', { resultId, error: error.message });
+    return res.status(502).json({ success: false, message: 'Delivery failed', error: error.message });
+  }
+}));
 
 // Get unassigned results (Admin only)
 app.get('/api/admin/unassigned-results', authenticateToken, requireAdmin, asyncHandler(async (req, res) => {
@@ -1976,7 +2250,8 @@ app.get('/api/download/ldt', authenticateToken, requirePermission('canDownloadRe
         city: process.env.LAB_CITY || 'Medical City',
         phone: process.env.LAB_PHONE || '+49-123-456789',
         email: process.env.LAB_EMAIL || 'info@laborresults.de'
-      }
+      },
+      provider: { bsnr: req.user.bsnr, lanr: req.user.lanr }
     });
 
     res.setHeader('Content-Type', 'application/octet-stream');
@@ -2023,7 +2298,8 @@ app.get('/api/download/ldt/:resultId', authenticateToken, requirePermission('can
         city: process.env.LAB_CITY || 'Medical City',
         phone: process.env.LAB_PHONE || '+49-123-456789',
         email: process.env.LAB_EMAIL || 'info@laborresults.de'
-      }
+      },
+      provider: { bsnr: anyResult.bsnr, lanr: anyResult.lanr }
     });
 
     res.setHeader('Content-Type', 'application/octet-stream');
@@ -2191,9 +2467,9 @@ function startServer(port, retries = 3) {
       logger.info(`Server running on http://localhost:${port}`);
       logger.info(`Environment: ${process.env.NODE_ENV || 'development'}`);
       logger.info('User management system initialized with default users:');
-      logger.info('  Admin: admin@laborresults.de / admin123');
-      logger.info('  Doctor: doctor@laborresults.de / doctor123');
-      logger.info('  Lab Tech: lab@laborresults.de / lab123');
+      logger.info('  Admin: admin@laborresults.de / [Password from ADMIN_DEFAULT_PASSWORD env var]');
+      logger.info('  Doctor: doctor@laborresults.de / [Password from DOCTOR_DEFAULT_PASSWORD env var]');
+      logger.info('  Lab Tech: lab@laborresults.de / [Password from LAB_DEFAULT_PASSWORD env var]');
     });
 
     // Handle server errors
@@ -2227,3 +2503,4 @@ function startServer(port, retries = 3) {
 const server = startServer(PORT);
 
 module.exports = app;
+```
