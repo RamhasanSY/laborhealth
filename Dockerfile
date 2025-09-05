@@ -53,7 +53,7 @@ FROM base AS production
 RUN addgroup -g 1001 -S nodejs && \
     adduser -S nodejs -u 1001
 
-// Copy source code from server directory
+#Copy source code from server directory
 COPY --chown=nodejs:nodejs server/ ./
 COPY --chown=nodejs:nodejs prisma ./prisma/
 COPY --chown=nodejs:nodejs server/entrypoint.sh /entrypoint.sh
