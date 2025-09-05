@@ -53,9 +53,10 @@ FROM base AS production
 RUN addgroup -g 1001 -S nodejs && \
     adduser -S nodejs -u 1001
 
-# Copy source code from server directory
+// Copy source code from server directory
 COPY --chown=nodejs:nodejs server/ ./
 COPY --chown=nodejs:nodejs prisma ./prisma/
+COPY --chown=nodejs:nodejs server/entrypoint.sh /entrypoint.sh
 
 # Create necessary directories
 RUN mkdir -p /app/logs /app/exports /app/uploads && \
@@ -70,6 +71,9 @@ EXPOSE 5000
 # Health check
 HEALTHCHECK --interval=30s --timeout=3s --start-period=5s --retries=3 \
     CMD node healthcheck.js
+
+# Entrypoint to run migrations then start
+ENTRYPOINT ["/entrypoint.sh"]
 
 # Start production server
 CMD ["npm", "start"]
