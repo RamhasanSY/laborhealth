@@ -166,6 +166,13 @@ class APIClient {
       signal: controller.signal,
     };
 
+    // Ensure body is a string for fetch when Content-Type is JSON
+    if (mergedOptions.body && typeof mergedOptions.body !== 'string' && mergedOptions.headers['Content-Type']?.includes('application/json')) {
+      try {
+        mergedOptions.body = JSON.stringify(mergedOptions.body);
+      } catch (_) {}
+    }
+
     // Ensure CSRF token for state-changing requests
     const methodUpper = (mergedOptions.method || 'GET').toUpperCase();
     const isStateChanging = !['GET', 'HEAD', 'OPTIONS'].includes(methodUpper);
@@ -185,7 +192,7 @@ class APIClient {
 
     // Check cache for GET requests
     const cacheKey = this.getCacheKey(url, finalOptions);
-    if (finalOptions.method === 'GET' || !finalOptions.method) {
+    if ((finalOptions.method || 'GET').toUpperCase() === 'GET') {
       const cached = this.getCache(cacheKey);
       if (cached) {
         return cached;

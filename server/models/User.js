@@ -88,11 +88,9 @@ class UserModel {
         if (process.env.LOG_ADMIN_CREATION === 'true') {
           console.log('✅ Initial admin user created for production');
           console.log(`   Email: ${adminUser.email}`); 
-          cursor/prepare-for-launch-backend-frontend-and-db-0a25
           console.log(`   Password set via ADMIN_PASSWORD or generated. CHANGE IMMEDIATELY!`);
 
           console.log(`   Password: ${process.env.ADMIN_DEFAULT_PASSWORD || 'Generated password - check logs'}`);
-            MAIN
           console.log('   ⚠️  IMPORTANT: Change the default password immediately!');
         }
       } catch (error) {

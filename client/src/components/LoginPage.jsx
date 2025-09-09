@@ -46,11 +46,14 @@ function LoginPage({ onLoginSuccess, onError }) {
         setMessage(response.message || 'Login failed');
       }
     } catch (error) {
-      console.error('Login error:', error);
+      if (process.env.NODE_ENV === 'development') {
+        console.error('Login error:', error);
+      }
       const errorMessage = (error?.name === 'TypeError')
         ? 'Netzwerkfehler: Server nicht erreichbar. Bitte erneut versuchen.'
         : (error.message || 'Unbekannter Fehler beim Anmelden');
       setMessage(errorMessage);
+      if (onError) onError(error);
       // Do not escalate to app-level error; show inline message only
     } finally {
       setIsLoading(false);

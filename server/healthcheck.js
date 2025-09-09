@@ -1,7 +1,7 @@
 const http = require('http');
 
-const host = process.env.HOST || '127.0.0.1';
-const port = process.env.PORT || 5000;
+const host = process.env.HEALTHCHECK_HOST || process.env.HOST || '127.0.0.1';
+const port = process.env.HEALTHCHECK_PORT || process.env.PORT || 5000;
 const path = '/api/health';
 
 function check() {

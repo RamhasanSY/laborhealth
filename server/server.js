@@ -53,7 +53,7 @@ const swaggerDefinition = {
 
 const swaggerOptions = {
   swaggerDefinition,
-  apis: ['./server.js'],
+  apis: [path.join(__dirname, 'server.js')],
 };
 
 const swaggerSpec = swaggerJsdoc(swaggerOptions);
@@ -423,8 +423,8 @@ const corsOptions = {
   },
   credentials: true,
   optionsSuccessStatus: 200,
-  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS'],
-  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-Tenant-Id'],
+  methods: ['GET', 'POST', 'PUT', 'DELETE', 'OPTIONS', 'PATCH'],
+  allowedHeaders: ['Content-Type', 'Authorization', 'X-Requested-With', 'X-Tenant-Id', 'X-CSRF-Token'],
   maxAge: 86400, // Cache preflight requests for 24 hours
 };
 app.use(cors(corsOptions));
@@ -2003,7 +2003,7 @@ const webhookReplayCache = new NodeCache({ stdTTL: 600, checkperiod: 120 });
 
 function validateContentType(req, res) {
   const ct = (req.headers['content-type'] || '').toLowerCase();
-  if (!(ct.includes('text/plain') || ct.includes('application/json'))) {
+  if (!(ct.includes('text/plain') || ct.includes('application/json') || ct.includes('application/ldt'))) {
     res.status(415).json({ success: false, message: 'Unsupported Content-Type' });
     return false;
   }
@@ -2503,4 +2503,4 @@ function startServer(port, retries = 3) {
 const server = startServer(PORT);
 
 module.exports = app;
-```
+

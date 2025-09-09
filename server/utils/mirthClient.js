@@ -37,6 +37,9 @@ async function sendLDTToMirth(ldtContent, options = {}) {
   }
 
   const headers = buildMirthHeaders(ldtContent, secret, options.headers);
+  // Ensure required lowercase headers mirror exist for some proxies expecting lowercase
+  headers['x-timestamp'] = headers['X-Timestamp'];
+  headers['x-signature'] = headers['X-Signature'];
 
   let lastError = null;
   for (let attempt = 0; attempt <= retries; attempt++) {

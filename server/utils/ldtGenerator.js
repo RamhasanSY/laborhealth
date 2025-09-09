@@ -19,9 +19,9 @@ class LDTGenerator {
 
   // Add a record with proper formatting
   addRecord(recordType, fieldId, content) {
-    const recordNum = this.recordNumber.toString().padStart(3, '0');
-    const length = (content.length + 13).toString().padStart(3, '0');
-    const record = `${length}${recordType}${fieldId}${content}`;
+    const safeContent = String(content ?? '');
+    const length = (safeContent.length + 11).toString().padStart(3, '0');
+    const record = `${length}${recordType}${fieldId}${safeContent}`;
     this.records.push(record);
     this.recordNumber++;
     return record;
